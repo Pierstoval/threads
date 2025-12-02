@@ -29,7 +29,6 @@ use function sprintf;
 
 class Run extends Command
 {
-    private SymfonyStyle $io;
     private ApiClient $client;
     private string $projectDir;
     private string $cacheDir;
@@ -48,28 +47,82 @@ class Run extends Command
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
-        $this->io = new SymfonyStyle($input, $output);
-
         $this->projectDir = dirname(__DIR__);
         $this->cacheDir = $this->projectDir.'/cache';
+        $io = new SymfonyStyle($input, $output);
+
+        $useCache = !$input->getOption('no-cache');
+        $accountName = $input->getArgument('account_name');
+        $minimumThreadSize = (int) $input->getOption('minimum-thread-size');
+
+        try {
+            $this->doRun($useCache, $io, $accountName, $minimumThreadSize);
+        } catch (\Throwable $e) {
+            do {
+                $io->error([
+                    $e::class,
+                    $e->getMessage(),
+                    $e->getTraceAsString(),
+                ]);
+            } while ($e = $e->getPrevious());
+
+            return self::FAILURE;
+        }
+
+        return self::SUCCESS;
+    }
+
+    private function doRun(bool $useCache, SymfonyStyle $io, mixed $accountName, int $minimumThreadSize): void
+    {
         if (!is_dir($this->cacheDir) && !mkdir($this->cacheDir, 0777, true) && !is_dir($this->cacheDir)) {
             throw new RuntimeException(sprintf('Directory "%s" could not be created', $this->cacheDir));
         }
-        $this->cachedDataFile = $this->cacheDir.'/cached_data.json';
+
+        $this->fetchCache($useCache);
+        $this->loadEnv();
+        $this->createClient();
+
+        $io->title('Running Threads');
+
+        $progress = new ProgressIndicator($io, indicatorChangeInterval: 10, indicatorValues: ['🌑', '🌒', '🌓', '🌔', '🌕', '🌖', '🌗', '🌘']);
+        $progress->start('Fetching statuses from Mastodon...');
+        $statuses = $this->fetchStatuses(
+            $accountName,
+            progressAdvance: static function (string $message) use ($progress) {
+                $progress->setMessage($message);
+                $progress->advance();
+            },
+            progressFinish: static fn(string $message) => $progress->finish($message),
+        );
+
+        $io->info('Number of statuses: ' . count($statuses));
+
+        $tree = $this->getThreadsTree($statuses, $minimumThreadSize);
+        $threads = $this->getThreadsStatusesFromTree($tree);
+
+        $io->info(sprintf('Found %d threads.', count($threads)));
+
+        $this->saveThreadsToCache($threads, $statuses);
+    }
+
+    private function fetchCache(bool $useCache = true): void
+    {
+        $this->cachedDataFile = $this->cacheDir . '/cached_data.json';
         $this->cachedData = [];
-        if (\is_file($this->cachedDataFile) && !$input->getOption('no-cache')) {
+        if (\is_file($this->cachedDataFile) && $useCache) {
             $this->cachedData = json_decode(file_get_contents($this->cachedDataFile), true, 512, JSON_THROW_ON_ERROR);
         }
+    }
 
-        $envFile = $this->projectDir.'/.env';
+    private function loadEnv(): void
+    {
+        $envFile = $this->projectDir . '/.env';
         if (!is_file($envFile)) {
-            $this->io->error(sprintf(
+            throw new \RuntimeException(sprintf(
                 'Env file "%s" does not exist. You can create it by copy/pasting the "%s" file.',
                 $envFile,
-                $envFile.'.example',
+                $envFile . '.example',
             ));
-
-            return 1;
         }
 
         $env = new Dotenv();
@@ -77,68 +130,56 @@ class Run extends Command
 
         $keys = [
             'APP_INSTANCE',
-            'APP_ID',
-            'APP_SECRET',
             'APP_ACCESS_TOKEN',
         ];
+
         foreach ($keys as $key) {
             if (!isset($_ENV[$key])) {
-                $this->io->error(\sprintf('Environment key "%s" is not set. Please make sure all the variables are set in the "%s" file.'."\n".'List of variables: %s', 'APP_INSTANCE', $envFile, implode(', ', $keys)));
+                throw new \RuntimeException(\sprintf('Environment key "%s" is not set. Please make sure all the variables are set in the "%s" file.' . "\n" . 'List of variables: %s', 'APP_INSTANCE', $envFile, implode(', ', $keys)));
             }
         }
+    }
 
-        $appInstance = $_ENV['APP_INSTANCE'];
-        $appId = $_ENV['APP_ID'];
-        $appSecret = $_ENV['APP_SECRET'];
-        $appAccessToken = $_ENV['APP_ACCESS_TOKEN'];
-
+    private function createClient(): void
+    {
         $factory = new ApiClientFactory();
         $this->client = $factory->build();
-        $this->client->setBaseUri('https://'.$appInstance);
-        $this->client->setAccessToken($appAccessToken);
+        $this->client->setBaseUri('https://' . $_ENV['APP_INSTANCE']);
+        $this->client->setAccessToken($_ENV['APP_ACCESS_TOKEN']);
+    }
 
-        $this->io->title('Running Threads');
+    private function fetchStatuses(string $accountName, ?\Closure $progressAdvance = null, ?\Closure $progressFinish = null): array
+    {
+        $progressAdvance = $progressAdvance ?: static fn () => null;
+        $progressFinish = $progressFinish ?: static fn () => null;
 
-        $accountName = $input->getArgument('account_name');
-
-        $account = $this->client->methods()->accounts()->lookup($accountName);
-
-        $id = $account->id;
+        $accountId = $this->client->methods()->accounts()->lookup($accountName)->id;
 
         $statuses = $this->cachedData['statuses'] ?? [];
         $lastId = $this->cachedData['last_id'] ?? null;
         $actualLastId = null;
 
-        $progress = new ProgressIndicator(
-            $this->io,
-            indicatorChangeInterval: 10,
-            indicatorValues: ['🌑', '🌒', '🌓', '🌔', '🌕', '🌖', '🌗', '🌘'],
-        );
-        $progress->start('Statuses found: 0');
-        $minimumThreadSize = (int) $input->getOption('minimum-thread-size');
         while (true) {
-            $progress->setMessage('Statuses found: '.\count($statuses));
-            $progress->advance();
+            $progressAdvance('Statuses found: ' . \count($statuses));
             if ($lastId && $actualLastId === $lastId) {
-                $progress->finish('Apparently found enough posts');
+                $progressFinish('Apparently found enough posts');
                 break;
             }
             $actualLastId = $lastId;
             try {
                 /** @var StatusModel[] $newStatuses */
                 $newStatuses = $this->client->methods()->accounts()->statuses(
-                    id: $id,
+                    id: $accountId,
                     max_id: $lastId,
                     limit: 40,
                 )->all();
                 if (!count($newStatuses)) {
-                    $progress->finish(' No more statuses to check');
+                    $progressFinish(' No more statuses to check');
                     break;
                 }
 
                 foreach ($newStatuses as $status) {
-                    $progress->setMessage('Statuses found: '.\count($statuses));
-                    $progress->advance();
+                    $progressAdvance('Statuses found: ' . \count($statuses));
                     $lastId = $status->id;
                     if (isset($statuses[$status->id])) {
                         continue;
@@ -156,37 +197,34 @@ class Run extends Command
                     ];
                     $store = [];
                     foreach ($keys as $key) {
-                        $progress->setMessage('Statuses found: '.\count($statuses));
+                        $progressAdvance('Statuses found: ' . \count($statuses));
                         $store[$key] = $status->$key;
                     }
                     $statuses[$status->id] = $store;
                 }
             } catch (TooManyRequestsException $e) {
-                $progress->finish(\sprintf('Too many requests after id "%s".', $lastId));
-                break;
-            } catch (Throwable $e) {
-                $progress->finish('Error');
-                do {
-                    $this->io->error([
-                        $e->getMessage(),
-                        $e->getTraceAsString(),
-                    ]);
-                } while ($e = $e->getPrevious());
+                $progressFinish(\sprintf('Too many requests after id "%s".', $lastId));
                 break;
             }
         }
         try {
-            $progress->finish('');
-        } catch (\Throwable) {}
+            $progressFinish('');
+        } catch (\Throwable) {
+        }
 
         $this->cachedData['last_id'] = $lastId;
         $this->cachedData['statuses'] = $statuses;
-        file_put_contents($this->cachedDataFile, json_encode($this->cachedData, JSON_PRETTY_PRINT|JSON_THROW_ON_ERROR|JSON_UNESCAPED_SLASHES));
 
-        $this->io->info('Number of statuses: '. count($statuses));
+        file_put_contents($this->cachedDataFile, json_encode($this->cachedData, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES));
 
+        return $statuses;
+    }
+
+    private function getThreadsTree(array $statuses, int $minimumThreadSize): array
+    {
         $tree = [];
-        foreach ($statuses as $id => $status) {
+
+        foreach ($statuses as $accountId => $status) {
             $parents = [];
             $currentStatus = $status;
 
@@ -210,26 +248,33 @@ class Run extends Command
                 continue;
             }
 
-            $tree[$id] = $parents;
+            $tree[$accountId] = $parents;
         }
 
+        return $tree;
+    }
+
+    private function getThreadsStatusesFromTree(array $tree): array
+    {
         $threads = [];
-        foreach ($tree as $id => $items) {
+        foreach ($tree as $accountId => $items) {
             $firstPostId = array_last($items);
             if (isset($threads[$firstPostId])) {
                 $thread = $threads[$firstPostId];
                 if (count($items) > count($thread)) {
                     $threads[$firstPostId] = array_reverse($items);
-                    $threads[$firstPostId][] = (string) $id;
+                    $threads[$firstPostId][] = (string)$accountId;
                 }
             } else {
                 $threads[$firstPostId] = array_reverse($items);
-                $threads[$firstPostId][] = (string) $id;
+                $threads[$firstPostId][] = (string)$accountId;
             }
         }
+        return $threads;
+    }
 
-        $this->io->info(sprintf('Found %d threads.', count($threads)));
-
+    private function saveThreadsToCache(array $threads, array $statuses): void
+    {
         foreach ($threads as $posts) {
             $content = [];
             foreach ($posts as $postId) {
@@ -237,9 +282,7 @@ class Run extends Command
             }
             $html = implode("\n\n", $content);
 
-            file_put_contents($this->cacheDir.'/post_'.$posts[0].'.html', $html);
+            file_put_contents($this->cacheDir . '/post_' . $posts[0] . '.html', $html);
         }
-
-        return 0;
     }
 }
