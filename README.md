@@ -1,6 +1,10 @@
 Fetch all your own Mastodon threads
 ===================================
 
+This small command utility helps you finding all your posts that can be considered as threads on your Mastodon instance. It includes your replies, so if you wrote a thread which first post is a reply to another user's post, it will be taken in account too.
+
+The number of posts necessary to consider a list of posts to be a thread is customizable.
+
 ## Prerequisites
 
 - PHP 8.4
