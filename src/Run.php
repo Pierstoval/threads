@@ -2,6 +2,7 @@
 
 namespace Pierstoval\Threads;
 
+use Closure;
 use RuntimeException;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Helper\ProgressIndicator;
@@ -16,9 +17,11 @@ use Vazaha\Mastodon\ApiClient;
 use Vazaha\Mastodon\Exceptions\TooManyRequestsException;
 use Vazaha\Mastodon\Factories\ApiClientFactory;
 use Vazaha\Mastodon\Models\StatusModel;
+
 use function count;
 use function dirname;
 use function file_put_contents;
+use function glob;
 use function implode;
 use function is_dir;
 use function is_file;
@@ -26,12 +29,15 @@ use function json_decode;
 use function json_encode;
 use function mkdir;
 use function sprintf;
+use function strip_tags;
+use function unlink;
 
 class Run extends Command
 {
     private ApiClient $client;
     private string $projectDir;
     private string $cacheDir;
+    private string $outputDir;
     private string $cachedDataFile;
     private array $cachedData;
 
@@ -49,6 +55,7 @@ class Run extends Command
     {
         $this->projectDir = dirname(__DIR__);
         $this->cacheDir = $this->projectDir.'/cache';
+        $this->outputDir = $this->cacheDir.'/output';
         $io = new SymfonyStyle($input, $output);
 
         $useCache = !$input->getOption('no-cache');
@@ -57,7 +64,7 @@ class Run extends Command
 
         try {
             $this->doRun($useCache, $io, $accountName, $minimumThreadSize);
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             do {
                 $io->error([
                     $e::class,
@@ -79,6 +86,7 @@ class Run extends Command
         }
 
         $this->fetchCache($useCache);
+        $this->clearOutput($useCache);
         $this->loadEnv();
         $this->createClient();
 
@@ -92,7 +100,7 @@ class Run extends Command
                 $progress->setMessage($message);
                 $progress->advance();
             },
-            progressFinish: static fn(string $message) => $progress->finish($message),
+            progressFinish: static fn (string $message) => $progress->finish($message),
         );
 
         $io->info('Number of statuses: ' . count($statuses));
@@ -109,8 +117,27 @@ class Run extends Command
     {
         $this->cachedDataFile = $this->cacheDir . '/cached_data.json';
         $this->cachedData = [];
-        if (\is_file($this->cachedDataFile) && $useCache) {
+        if (is_file($this->cachedDataFile) && $useCache) {
             $this->cachedData = json_decode(file_get_contents($this->cachedDataFile), true, 512, JSON_THROW_ON_ERROR);
+        }
+    }
+
+    private function clearOutput(bool $useCache): void
+    {
+        if (!is_dir($this->outputDir)) {
+            if (!mkdir($concurrentDirectory = $this->outputDir, 0777, true) && !is_dir($concurrentDirectory)) {
+                throw new RuntimeException(sprintf('Directory "%s" was not created', $concurrentDirectory));
+            }
+            // No need for cache check: directory was already empty
+            return;
+        }
+
+        if ($useCache) {
+            return;
+        }
+
+        foreach (glob($this->outputDir.'/*.html') as $file) {
+            unlink($file);
         }
     }
 
@@ -118,7 +145,7 @@ class Run extends Command
     {
         $envFile = $this->projectDir . '/.env';
         if (!is_file($envFile)) {
-            throw new \RuntimeException(sprintf(
+            throw new RuntimeException(sprintf(
                 'Env file "%s" does not exist. You can create it by copy/pasting the "%s" file.',
                 $envFile,
                 $envFile . '.example',
@@ -135,7 +162,7 @@ class Run extends Command
 
         foreach ($keys as $key) {
             if (!isset($_ENV[$key])) {
-                throw new \RuntimeException(\sprintf('Environment key "%s" is not set. Please make sure all the variables are set in the "%s" file.' . "\n" . 'List of variables: %s', 'APP_INSTANCE', $envFile, implode(', ', $keys)));
+                throw new RuntimeException(sprintf('Environment key "%s" is not set. Please make sure all the variables are set in the "%s" file.' . "\n" . 'List of variables: %s', 'APP_INSTANCE', $envFile, implode(', ', $keys)));
             }
         }
     }
@@ -148,7 +175,7 @@ class Run extends Command
         $this->client->setAccessToken($_ENV['APP_ACCESS_TOKEN']);
     }
 
-    private function fetchStatuses(string $accountName, ?\Closure $progressAdvance = null, ?\Closure $progressFinish = null): array
+    private function fetchStatuses(string $accountName, ?Closure $progressAdvance = null, ?Closure $progressFinish = null): array
     {
         $progressAdvance = $progressAdvance ?: static fn () => null;
         $progressFinish = $progressFinish ?: static fn () => null;
@@ -160,7 +187,7 @@ class Run extends Command
         $actualLastId = null;
 
         while (true) {
-            $progressAdvance('Statuses found: ' . \count($statuses));
+            $progressAdvance('Statuses found: ' . count($statuses));
             if ($lastId && $actualLastId === $lastId) {
                 $progressFinish('Apparently found enough posts');
                 break;
@@ -179,7 +206,7 @@ class Run extends Command
                 }
 
                 foreach ($newStatuses as $status) {
-                    $progressAdvance('Statuses found: ' . \count($statuses));
+                    $progressAdvance('Statuses found: ' . count($statuses));
                     $lastId = $status->id;
                     if (isset($statuses[$status->id])) {
                         continue;
@@ -197,19 +224,19 @@ class Run extends Command
                     ];
                     $store = [];
                     foreach ($keys as $key) {
-                        $progressAdvance('Statuses found: ' . \count($statuses));
+                        $progressAdvance('Statuses found: ' . count($statuses));
                         $store[$key] = $status->$key;
                     }
                     $statuses[$status->id] = $store;
                 }
             } catch (TooManyRequestsException $e) {
-                $progressFinish(\sprintf('Too many requests after id "%s".', $lastId));
+                $progressFinish(sprintf('Too many requests after id "%s".', $lastId));
                 break;
             }
         }
         try {
             $progressFinish('');
-        } catch (\Throwable) {
+        } catch (Throwable) {
         }
 
         $this->cachedData['last_id'] = $lastId;
@@ -243,7 +270,7 @@ class Run extends Command
                 } while ($currentStatus['in_reply_to_id'] !== null);
             }
 
-            if (count($parents) <= $minimumThreadSize) {
+            if (count($parents) < $minimumThreadSize) {
                 // Not a thread
                 continue;
             }
@@ -276,13 +303,19 @@ class Run extends Command
     private function saveThreadsToCache(array $threads, array $statuses): void
     {
         foreach ($threads as $posts) {
-            $content = [];
+            $content = [
+                sprintf(
+                    '<a href="%s">(%s)</a><br>',
+                    $statuses[$posts[0]]['uri'],
+                    $statuses[$posts[0]]['created_at'],
+                ),
+            ];
             foreach ($posts as $postId) {
                 $content[] = $statuses[$postId]['content'];
             }
             $html = implode("\n\n", $content);
 
-            file_put_contents($this->cacheDir . '/post_' . $posts[0] . '.html', $html);
+            file_put_contents($this->outputDir . '/post_' . count($posts) . '_' . $posts[0] . '.html', $html);
         }
     }
 }
