@@ -29,7 +29,6 @@ use function json_decode;
 use function json_encode;
 use function mkdir;
 use function sprintf;
-use function strip_tags;
 use function unlink;
 
 class Run extends Command
@@ -47,7 +46,7 @@ class Run extends Command
             ->setName('threads:run')
             ->addArgument('account_name', InputArgument::REQUIRED, 'Account name')
             ->addOption('no-cache', null, InputOption::VALUE_NONE, 'Whether to use cache or not')
-            ->addOption('minimum-thread-size', 'm', InputOption::VALUE_OPTIONAL, 'Minimum of replies to consider it a "thread".', 2)
+            ->addOption('minimum-thread-size', 'm', InputOption::VALUE_OPTIONAL, 'Minimum number of posts to consider it a "thread".', 3)
         ;
     }
 
@@ -86,7 +85,7 @@ class Run extends Command
         }
 
         $this->fetchCache($useCache);
-        $this->clearOutput($useCache);
+        $this->clearOutput();
         $this->loadEnv();
         $this->createClient();
 
@@ -110,7 +109,7 @@ class Run extends Command
 
         $io->info(sprintf('Found %d threads.', count($threads)));
 
-        $this->saveThreadsToCache($threads, $statuses);
+        $this->saveThreadsToCache($threads, $statuses, $minimumThreadSize);
     }
 
     private function fetchCache(bool $useCache = true): void
@@ -122,17 +121,13 @@ class Run extends Command
         }
     }
 
-    private function clearOutput(bool $useCache): void
+    private function clearOutput(): void
     {
         if (!is_dir($this->outputDir)) {
             if (!mkdir($concurrentDirectory = $this->outputDir, 0777, true) && !is_dir($concurrentDirectory)) {
                 throw new RuntimeException(sprintf('Directory "%s" was not created', $concurrentDirectory));
             }
             // No need for cache check: directory was already empty
-            return;
-        }
-
-        if ($useCache) {
             return;
         }
 
@@ -247,7 +242,7 @@ class Run extends Command
         return $statuses;
     }
 
-    private function getThreadsTree(array $statuses, int $minimumThreadSize): array
+    private function getThreadsTree(array $statuses): array
     {
         $tree = [];
 
@@ -268,11 +263,6 @@ class Run extends Command
                     $currentStatus = $statuses[$parentId];
 
                 } while ($currentStatus['in_reply_to_id'] !== null);
-            }
-
-            if (count($parents) < $minimumThreadSize) {
-                // Not a thread
-                continue;
             }
 
             $tree[$accountId] = $parents;
@@ -300,9 +290,15 @@ class Run extends Command
         return $threads;
     }
 
-    private function saveThreadsToCache(array $threads, array $statuses): void
+    private function saveThreadsToCache(array $threads, array $statuses, int $minimumThreadSize): void
     {
         foreach ($threads as $posts) {
+            $numberOfPosts = \count($posts);
+
+            if ($numberOfPosts < $minimumThreadSize) {
+                continue;
+            }
+
             $content = [
                 sprintf(
                     '<a href="%s">(%s)</a><br>',
@@ -315,7 +311,7 @@ class Run extends Command
             }
             $html = implode("\n\n", $content);
 
-            file_put_contents($this->outputDir . '/post_' . count($posts) . '_' . $posts[0] . '.html', $html);
+            file_put_contents($this->outputDir . '/post_' . $numberOfPosts . '_' . $posts[0] . '.html', $html);
         }
     }
 }
